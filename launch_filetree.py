@@ -154,17 +154,63 @@ async def main(connection):
     await tree_session.async_send_text(f"python3 '{FILETREE_SCRIPT}' '{start_dir}'\n")
     await current_session.async_activate()
 
-    log(f"daemon ready, watching cd events")
+    log(f"daemon ready")
 
-    # Sesiones excluidas: NUNCA sincronizan el árbol
+    HOME = str(Path.home())
     excluded = {tree_session_id}
+    last_path = start_dir          # último path "de trabajo" enviado al árbol
+
+    # ── Watcher de foco entre paneles/tabs ────────────────────────────────
+    # Actualiza el árbol cuando el usuario cambia de panel.
+    # Regla anti-ruido: si el CWD de la sesión enfocada es $HOME pero el
+    # último path conocido no lo era, se ignora (evita que Claude Code u
+    # otras sesiones estáticas en ~ sobreescriban el directorio de trabajo).
+    async def sync_session(session, source: str):
+        """Lee el CWD de una sesión y lo envía al árbol.
+        Si el primer intento devuelve HOME, reintenta tras 400 ms para dar
+        tiempo a que shell integration actualice la variable path."""
+        nonlocal last_path
+        sid = session.session_id
+        cwd = await get_session_cwd(session)
+        log(f"{source} sid={sid[:8]} cwd={cwd}")
+        if not cwd:
+            return
+        if cwd == HOME and last_path != HOME:
+            log(f"{source} HOME→retry sid={sid[:8]}")
+            await asyncio.sleep(0.4)
+            # Verificar que esta sesión siga siendo la activa
+            win = app.current_terminal_window
+            if not win:
+                return
+            active = win.current_tab.current_session
+            if not active or active.session_id != sid or sid in excluded:
+                return
+            cwd = await get_session_cwd(session)
+            log(f"{source} retry sid={sid[:8]} cwd={cwd}")
+            if not cwd or (cwd == HOME and last_path != HOME):
+                log(f"{source} still HOME, skip sid={sid[:8]}")
+                return
+        last_path = cwd
+        write_to_pipe(cwd, source)
+
+    async def on_focus_change(focus_event):
+        try:
+            sid = focus_event.session_id
+            if not sid or sid in excluded:
+                log(f"FOCUS skip sid={sid[:8] if sid else 'none'}")
+                return
+            for w in app.terminal_windows:
+                for tab in w.tabs:
+                    for session in tab.sessions:
+                        if session.session_id == sid:
+                            await sync_session(session, f"focus:{sid[:8]}")
+                            return
+        except Exception as e:
+            log(f"FOCUS ERROR: {e}")
 
     # ── Watcher de cd dentro de sesión ────────────────────────────────────
-    # Solo sincroniza en `cd` explícitos — no en cambios de foco.
-    # Esto evita que sesiones estáticas (Claude Code, etc.) a ~ sobreescriban
-    # el directorio de trabajo.
-    # El primer valor de VariableMonitor es el CWD actual al arrancar (no un
-    # cambio real), se descarta para evitar escrituras espurias al inicio.
+    # El primer valor de VariableMonitor es el CWD actual (no un cambio real),
+    # se descarta para evitar escrituras espurias al inicio.
     watched = set()
 
     async def watch_session_path(session):
@@ -218,7 +264,12 @@ async def main(connection):
                         asyncio.ensure_future(watch_session_path(session))
                         return
 
-    await _watch_new_sessions(connection, on_new_session)
+    async with iterm2.FocusMonitor(connection) as focus_mon:
+        asyncio.ensure_future(_watch_new_sessions(connection, on_new_session))
+        while True:
+            update = await focus_mon.async_get_next_update()
+            if update.active_session_changed:
+                await on_focus_change(update.active_session_changed)
 
 
 async def _watch_new_sessions(connection, callback):
